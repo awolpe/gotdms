@@ -1,0 +1,1238 @@
+package tdms
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"math"
+	"os"
+)
+
+// File is an open TDMS file. It is safe for concurrent value reads when the
+// underlying io.ReaderAt is. Close it when finished.
+type File struct {
+	r       io.ReaderAt
+	closer  io.Closer
+	path    string
+	size    int64
+	version uint32
+	segs    int
+
+	props  []Property
+	groups []*Group
+	gindex map[string]int
+	byPath map[string]*Channel
+}
+
+// Group is a named collection of channels.
+type Group struct {
+	file     *File
+	name     string
+	props    []Property
+	channels []*Channel
+	chIndex  map[string]int
+}
+
+// Channel is one raw-data series plus its properties.
+//
+// Values are concatenated across segments in file order. A channel that is
+// absent from a later segment keeps the samples it already has; later segments
+// append more samples when the channel reappears.
+type Channel struct {
+	file  *File
+	group *Group
+	name  string
+	path  string
+	dt    DataType
+	hasDT bool
+	props []Property
+	idx   rawIndex
+	spans []span
+	total int64
+}
+
+type rawIndex struct {
+	known bool
+	none  bool
+	dt    DataType
+	n     int64
+	total int64
+}
+
+// span is one segment's contribution to a channel.
+//
+// Fixed-size values are addressed as
+//
+//	fileOff = regionBase + col + valueIndex*stride
+//
+// Contiguous channels use stride == typeSize and col == offset of the channel's
+// block. Interleaved channels use stride == sum of the sample widths and col ==
+// the channel's offset inside the sample row.
+type span struct {
+	dataPos   int64
+	chunkSize int64
+	nChunks   int64
+	nPerChunk int64
+	col       int64
+	stride    int64
+	typeSize  int
+	big       bool
+
+	str     bool
+	strSize int64
+
+	partialN      int64
+	partialPos    int64
+	partialCol    int64
+	partialStride int64
+}
+
+// Open opens the TDMS file at path.
+func Open(path string) (*File, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, wrap("open", path, err)
+	}
+	tf, err := NewReader(f)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	tf.closer = f
+	tf.path = path
+	return tf, nil
+}
+
+// NewReader reads a TDMS file from r. r must be able to report its length,
+// either with a Size method (bytes.Reader, io.SectionReader), as an *os.File,
+// or as an io.Seeker. Metadata is parsed now; raw samples stay on r until a
+// channel read. NewReader does not close r.
+func NewReader(r io.ReaderAt) (*File, error) {
+	if r == nil {
+		return nil, wrap("open", "", fmt.Errorf("%w: nil reader", ErrArgument))
+	}
+	sz, err := readerSize(r)
+	if err != nil {
+		return nil, wrap("open", "", err)
+	}
+	if sz < 0 {
+		return nil, wrap("open", "", ErrCorrupt)
+	}
+	f := &File{
+		r:      r,
+		size:   sz,
+		gindex: map[string]int{},
+		byPath: map[string]*Channel{},
+	}
+	if err := f.parse(); err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// Close releases the file opened by Open. It is a no-op for NewReader.
+// Reads after Close return ErrClosed.
+func (f *File) Close() error {
+	f.r = nil
+	if f.closer == nil {
+		return nil
+	}
+	err := f.closer.Close()
+	f.closer = nil
+	return err
+}
+
+// Version is the TDMS version of the first segment, 4712 or 4713.
+func (f *File) Version() uint32 { return f.version }
+
+// SegmentCount is the number of lead-ins parsed.
+func (f *File) SegmentCount() int { return f.segs }
+
+// Properties returns a copy of the file-level properties in file order.
+func (f *File) Properties() []Property { return copyProps(f.props) }
+
+// Property returns the file-level property name. The second result is false
+// when the property was never written.
+func (f *File) Property(name string) (Property, bool) { return findProp(f.props, name) }
+
+// Groups returns groups in the order they first appear.
+func (f *File) Groups() []*Group {
+	out := make([]*Group, len(f.groups))
+	copy(out, f.groups)
+	return out
+}
+
+// Group looks up a group by its unquoted name.
+func (f *File) Group(name string) (*Group, bool) {
+	i, ok := f.gindex[name]
+	if !ok {
+		return nil, false
+	}
+	return f.groups[i], true
+}
+
+// Name is the group name without path quoting.
+func (g *Group) Name() string { return g.name }
+
+// Path is the TDMS object path, for example /'demo'.
+func (g *Group) Path() string { return groupPath(g.name) }
+
+// Properties returns a copy of the group's properties.
+func (g *Group) Properties() []Property { return copyProps(g.props) }
+
+// Property looks up a group property by name.
+func (g *Group) Property(name string) (Property, bool) { return findProp(g.props, name) }
+
+// Channels returns channels in the order they first appear.
+func (g *Group) Channels() []*Channel {
+	out := make([]*Channel, len(g.channels))
+	copy(out, g.channels)
+	return out
+}
+
+// Channel looks up a channel by its unquoted name.
+func (g *Group) Channel(name string) (*Channel, bool) {
+	i, ok := g.chIndex[name]
+	if !ok {
+		return nil, false
+	}
+	return g.channels[i], true
+}
+
+// Name is the channel name without path quoting.
+func (c *Channel) Name() string { return c.name }
+
+// GroupName is the unquoted name of the owning group.
+func (c *Channel) GroupName() string { return c.group.name }
+
+// Path is the TDMS object path, for example /'demo'/'voltage'.
+func (c *Channel) Path() string { return c.path }
+
+// DataType is the channel's raw-data type. It is TypeVoid until an index
+// assigns one.
+func (c *Channel) DataType() DataType { return c.dt }
+
+// Len is the number of raw values across every segment.
+func (c *Channel) Len() int { return int(c.total) }
+
+// Properties returns a copy of the channel's properties.
+func (c *Channel) Properties() []Property { return copyProps(c.props) }
+
+// Property looks up a channel property by name.
+func (c *Channel) Property(name string) (Property, bool) { return findProp(c.props, name) }
+
+// Values reads every raw value. The concrete type is:
+//
+//	TypeInt8 []int8, TypeInt16 []int16, TypeInt32 []int32, TypeInt64 []int64,
+//	TypeUint8 []uint8, TypeUint16 []uint16, TypeUint32 []uint32, TypeUint64 []uint64,
+//	TypeFloat32 []float32, TypeFloat64 []float64,
+//	TypeFloat32WithUnit []float32, TypeFloat64WithUnit []float64,
+//	TypeExtendedFloat and TypeExtendedFloatWithUnit []Extended,
+//	TypeBool []bool, TypeString []string, TypeTimestamp []Timestamp,
+//	TypeComplex64 []complex64, TypeComplex128 []complex128.
+//
+// A channel that never received a raw-data index returns nil, nil.
+// The returned slice is newly allocated.
+func (c *Channel) Values() (any, error) {
+	return c.readRange(0, c.Len())
+}
+
+// Cursor returns a batching reader. batch is the maximum number of values
+// Next yields; non-positive batch selects 4096. The slices returned by Values
+// are valid until the next Next call.
+func (c *Channel) Cursor(batch int) *Cursor {
+	if batch <= 0 {
+		batch = 4096
+	}
+	return &Cursor{ch: c, batch: batch}
+}
+
+// Cursor streams one channel in batches without retaining earlier batches.
+type Cursor struct {
+	ch    *Channel
+	batch int
+	pos   int
+	cur   any
+	err   error
+}
+
+// Next loads the next batch. It returns false at the end or after an error.
+// Err distinguishes those two.
+func (cur *Cursor) Next() bool {
+	if cur.err != nil || cur.ch == nil {
+		return false
+	}
+	if cur.pos >= cur.ch.Len() {
+		cur.cur = nil
+		return false
+	}
+	n := cur.batch
+	if cur.pos+n > cur.ch.Len() {
+		n = cur.ch.Len() - cur.pos
+	}
+	v, err := cur.ch.readRange(cur.pos, n)
+	if err != nil {
+		cur.err = wrap("read", cur.ch.path, err)
+		cur.cur = nil
+		return false
+	}
+	cur.cur = v
+	cur.pos += n
+	return true
+}
+
+// Err returns the error from the last Next, or nil.
+func (cur *Cursor) Err() error { return cur.err }
+
+// Values returns the current batch as documented on Channel.Values.
+func (cur *Cursor) Values() any { return cur.cur }
+
+// Len is the current batch length.
+func (cur *Cursor) Len() int { return sliceLen(cur.cur) }
+
+// Float64s converts the current batch with the same rules as Channel.Float64s.
+func (cur *Cursor) Float64s() ([]float64, error) {
+	if cur.cur == nil {
+		return nil, wrap("read", cur.ch.path, ErrArgument)
+	}
+	return toFloat64s(cur.cur)
+}
+
+func (c *Channel) readRange(start, n int) (any, error) {
+	if c.file == nil || c.file.r == nil {
+		return nil, wrap("read", c.path, ErrClosed)
+	}
+	if start < 0 || n < 0 || int64(start) > c.total || int64(n) > c.total-int64(start) {
+		return nil, wrap("read", c.path, fmt.Errorf("%w: range %d:%d of %d", ErrArgument, start, n, c.total))
+	}
+	if !c.hasDT {
+		if n == 0 {
+			return nil, nil
+		}
+		return nil, wrap("read", c.path, ErrCorrupt)
+	}
+	if c.dt == TypeString {
+		if n == 0 {
+			return []string{}, nil
+		}
+		s, err := c.readStrings(start, n)
+		if err != nil {
+			return nil, wrap("read", c.path, err)
+		}
+		return s, nil
+	}
+	if n == 0 {
+		v, err := emptyOf(c.dt)
+		return v, wrap("read", c.path, err)
+	}
+	sz, ok := c.dt.Size()
+	if !ok {
+		return nil, wrap("read", c.path, fmt.Errorf("%w: %s", ErrUnsupported, c.dt))
+	}
+	buf, err := c.readPacked(start, n, sz)
+	if err != nil {
+		return nil, wrap("read", c.path, err)
+	}
+	v, err := decodePacked(c.dt, buf)
+	if err != nil {
+		return nil, wrap("read", c.path, err)
+	}
+	return v, nil
+}
+
+func (f *File) parse() error {
+	if f.size == 0 {
+		return wrap("read", f.path, ErrTruncated)
+	}
+	var order []string
+	haveOrder := false
+	pos := int64(0)
+	for pos < f.size {
+		if f.size-pos < leadInSize {
+			return wrapf("read", f.path, ErrTruncated, "%d trailing bytes", f.size-pos)
+		}
+		var hdr [leadInSize]byte
+		if err := readFull(f.r, hdr[:], pos); err != nil {
+			return wrapf("read", f.path, err, "lead-in at %d", pos)
+		}
+		lead, err := decodeLeadIn(hdr[:])
+		if err != nil {
+			return wrapf("read", f.path, err, "segment at %d", pos)
+		}
+		if lead.version != Version10 && lead.version != Version20 {
+			return wrapf("read", f.path, ErrVersion, "segment at %d version %d", pos, lead.version)
+		}
+		if f.segs == 0 {
+			f.version = lead.version
+		}
+		if lead.toc&TocDAQmxRawData != 0 {
+			return wrapf("read", f.path, ErrDAQmx, "segment at %d sets kTocDAQmxRawData", pos)
+		}
+		segEnd, dataPos, err := segmentBounds(pos, f.size, lead)
+		if err != nil {
+			return wrapf("read", f.path, err, "segment at %d", pos)
+		}
+		hasMeta := lead.toc&TocMetaData != 0
+		if !hasMeta && lead.raw != 0 {
+			return wrapf("read", f.path, ErrCorrupt, "segment at %d has raw-data offset %d without kTocMetaData", pos, lead.raw)
+		}
+		if !hasMeta && !haveOrder {
+			return wrapf("read", f.path, ErrCorrupt, "first segment has no metadata")
+		}
+		rawLen := segEnd - dataPos
+		hasRaw := rawLen > 0
+		if lead.toc&TocRawData == 0 && hasRaw {
+			return wrapf("read", f.path, ErrCorrupt, "segment at %d has %d raw bytes without kTocRawData", pos, rawLen)
+		}
+		big := lead.toc&TocBigEndian != 0
+		newList := lead.toc&TocNewObjList != 0
+		if hasMeta {
+			meta := make([]byte, lead.raw)
+			if lead.raw > 0 {
+				if err := readFull(f.r, meta, pos+leadInSize); err != nil {
+					return wrapf("read", f.path, err, "metadata at %d", pos+leadInSize)
+				}
+			}
+			order, err = f.readMeta(meta, order, haveOrder, newList, hasRaw, big)
+			if err != nil {
+				return err
+			}
+			haveOrder = true
+		}
+		if hasRaw {
+			slots, err := f.slotsFrom(order)
+			if err != nil {
+				return wrapf("read", f.path, err, "segment at %d", pos)
+			}
+			interleaved := lead.toc&TocInterleavedData != 0
+			if err := f.addSpans(slots, dataPos, rawLen, interleaved, big, lead.next == incompleteSegment); err != nil {
+				return wrapf("read", f.path, err, "segment at %d", pos)
+			}
+		}
+		f.segs++
+		if lead.next == incompleteSegment {
+			break
+		}
+		pos = segEnd
+	}
+	return nil
+}
+
+func segmentBounds(pos, size int64, lead leadIn) (segEnd, dataPos int64, err error) {
+	if lead.raw > math.MaxInt64 {
+		return 0, 0, ErrCorrupt
+	}
+	dataPos, err = add64(pos, leadInSize)
+	if err != nil {
+		return 0, 0, err
+	}
+	dataPos, err = add64(dataPos, int64(lead.raw))
+	if err != nil {
+		return 0, 0, err
+	}
+	if lead.next == incompleteSegment {
+		if dataPos > size {
+			return 0, 0, ErrTruncated
+		}
+		return size, dataPos, nil
+	}
+	if lead.next > math.MaxInt64 {
+		return 0, 0, ErrCorrupt
+	}
+	segEnd, err = add64(pos, leadInSize)
+	if err != nil {
+		return 0, 0, err
+	}
+	segEnd, err = add64(segEnd, int64(lead.next))
+	if err != nil {
+		return 0, 0, err
+	}
+	if segEnd > size || dataPos > segEnd {
+		return 0, 0, ErrTruncated
+	}
+	return segEnd, dataPos, nil
+}
+
+const (
+	idxNone = iota
+	idxMatch
+	idxFull
+)
+
+func (f *File) readMeta(meta []byte, order []string, haveOrder, newList, hasRaw, big bool) ([]string, error) {
+	var bo binary.ByteOrder = binary.LittleEndian
+	if big {
+		bo = binary.BigEndian
+	}
+	d := decoder{b: meta, bo: bo}
+	if len(meta) == 0 {
+		if newList && hasRaw {
+			return []string{}, nil
+		}
+		return order, nil
+	}
+	nobj, err := d.u32()
+	if err != nil {
+		return nil, wrap("read", f.path, err)
+	}
+	if uint64(nobj) > uint64(len(meta)) {
+		return nil, wrap("read", f.path, ErrCorrupt)
+	}
+	next := order
+	if hasRaw && (newList || !haveOrder) {
+		next = nil
+	} else if hasRaw {
+		next = append([]string(nil), order...)
+	}
+	removed := map[string]bool{}
+	inNext := map[string]bool{}
+	for _, p := range next {
+		inNext[p] = true
+	}
+	seen := map[string]bool{}
+	for i := uint32(0); i < nobj; i++ {
+		opath, err := d.str()
+		if err != nil {
+			return nil, wrap("read", f.path, err)
+		}
+		if seen[opath] {
+			return nil, wrapf("read", opath, ErrCorrupt, "duplicate object in segment")
+		}
+		seen[opath] = true
+		mode, body, err := d.rawHeader()
+		if err != nil {
+			return nil, wrap("read", opath, err)
+		}
+		kind, group, channel, err := parseObjectPath(opath)
+		if err != nil {
+			return nil, wrapf("read", opath, err, "object path")
+		}
+		var ch *Channel
+		switch kind {
+		case kindFile:
+			if mode == idxFull {
+				return nil, wrap("read", opath, fmt.Errorf("%w: file object has raw data", ErrCorrupt))
+			}
+		case kindGroup:
+			if mode == idxFull {
+				return nil, wrap("read", opath, fmt.Errorf("%w: group object has raw data", ErrCorrupt))
+			}
+			f.ensureGroup(group)
+		case kindChannel:
+			ch = f.ensureChannel(group, channel)
+		}
+		if mode == idxFull {
+			dt, n, total, err := parseFullIndex(body, bo)
+			if err != nil {
+				return nil, wrap("read", opath, err)
+			}
+			if ch == nil {
+				return nil, wrap("read", opath, fmt.Errorf("%w: raw data on non-channel", ErrCorrupt))
+			}
+			if ch.hasDT && ch.dt != dt {
+				return nil, wrapf("read", opath, ErrCorrupt, "data type changed from %s to %s", ch.dt, dt)
+			}
+			ch.dt = dt
+			ch.hasDT = true
+			if hasRaw {
+				ch.idx = rawIndex{known: true, dt: dt, n: n, total: total}
+			}
+		} else if mode == idxMatch {
+			if ch != nil && hasRaw {
+				if !ch.idx.known {
+					return nil, wrap("read", opath, fmt.Errorf("%w: raw index matches previous segment but there is none", ErrCorrupt))
+				}
+			}
+		} else if ch != nil && hasRaw {
+			ch.idx = rawIndex{known: true, none: true}
+		}
+		nprops, err := d.u32()
+		if err != nil {
+			return nil, wrap("read", opath, err)
+		}
+		for p := uint32(0); p < nprops; p++ {
+			prop, err := decodeProperty(&d)
+			if err != nil {
+				return nil, wrap("read", opath, err)
+			}
+			switch kind {
+			case kindFile:
+				upsert(&f.props, prop)
+			case kindGroup:
+				g := f.ensureGroup(group)
+				upsert(&g.props, prop)
+			case kindChannel:
+				upsert(&ch.props, prop)
+			}
+		}
+		if !hasRaw || ch == nil {
+			continue
+		}
+		switch {
+		case ch.idx.none || !ch.idx.known:
+			removed[ch.path] = true
+			delete(inNext, ch.path)
+		default:
+			delete(removed, ch.path)
+			if !inNext[ch.path] {
+				next = append(next, ch.path)
+				inNext[ch.path] = true
+			}
+		}
+	}
+	if d.remain() != 0 {
+		return nil, wrapf("read", f.path, ErrCorrupt, "%d unused metadata bytes", d.remain())
+	}
+	if !hasRaw {
+		return order, nil
+	}
+	compact := next[:0]
+	for _, p := range next {
+		if !removed[p] {
+			compact = append(compact, p)
+		}
+	}
+	return compact, nil
+}
+
+func (d *decoder) rawHeader() (int, []byte, error) {
+	h, err := d.u32()
+	if err != nil {
+		return 0, nil, err
+	}
+	switch h {
+	case RawIndexNoData:
+		return idxNone, nil, nil
+	case RawIndexMatchesPrevious:
+		return idxMatch, nil, nil
+	case RawIndexDAQmxFormatChanging, RawIndexDAQmxDigitalLine, RawIndexDAQmxDigitalObserved:
+		return 0, nil, ErrDAQmx
+	}
+	if h < 20 {
+		return 0, nil, fmt.Errorf("%w: raw-data index length %d", ErrCorrupt, h)
+	}
+	body, err := d.bytes(int(h - 4))
+	if err != nil {
+		return 0, nil, err
+	}
+	return idxFull, body, nil
+}
+
+func parseFullIndex(body []byte, bo binary.ByteOrder) (DataType, int64, int64, error) {
+	if len(body) < 16 {
+		return 0, 0, 0, fmt.Errorf("%w: raw-data index shorter than 20 bytes", ErrCorrupt)
+	}
+	d := decoder{b: body, bo: bo}
+	code, err := d.u32()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	dim, err := d.u32()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if dim != 1 {
+		return 0, 0, 0, fmt.Errorf("%w: array dimension %d, TDMS 2.0 requires 1", ErrUnsupported, dim)
+	}
+	count, err := d.u64()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	n, err := u64ToI64(count)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	dt := DataType(code)
+	switch dt {
+	case TypeDAQmxRaw:
+		return 0, 0, 0, ErrDAQmx
+	case TypeFixedPoint:
+		return 0, 0, 0, fmt.Errorf("%w: %s", ErrUnsupported, dt)
+	case TypeVoid:
+		if n != 0 {
+			return 0, 0, 0, fmt.Errorf("%w: void channel has %d values", ErrCorrupt, n)
+		}
+		return dt, 0, 0, nil
+	case TypeString:
+		if len(body) < 24 {
+			return 0, 0, 0, fmt.Errorf("%w: string index missing total size", ErrCorrupt)
+		}
+		tot, err := d.u64()
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		total, err := u64ToI64(tot)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		if n > 0 && uint64(total)/4 < uint64(n) {
+			return 0, 0, 0, fmt.Errorf("%w: string total size %d too small for %d offsets", ErrCorrupt, total, n)
+		}
+		return dt, n, total, nil
+	default:
+		sz, ok := dt.Size()
+		if !ok {
+			return 0, 0, 0, fmt.Errorf("%w: %s", ErrUnsupported, dt)
+		}
+		if _, err := mul64(n, int64(sz)); err != nil {
+			return 0, 0, 0, err
+		}
+		return dt, n, 0, nil
+	}
+}
+
+func (f *File) slotsFrom(order []string) ([]rawSlot, error) {
+	slots := make([]rawSlot, 0, len(order))
+	for _, p := range order {
+		ch := f.byPath[p]
+		if ch == nil || !ch.idx.known || ch.idx.none {
+			return nil, fmt.Errorf("%w: channel %s is in the raw order without an index", ErrCorrupt, p)
+		}
+		slots = append(slots, rawSlot{ch: ch, dt: ch.idx.dt, n: ch.idx.n, total: ch.idx.total})
+	}
+	return slots, nil
+}
+
+type rawSlot struct {
+	ch    *Channel
+	dt    DataType
+	n     int64
+	total int64
+}
+
+func (f *File) addSpans(slots []rawSlot, dataPos, rawLen int64, interleaved, big, incomplete bool) error {
+	if len(slots) == 0 {
+		if rawLen != 0 {
+			return fmt.Errorf("%w: %d raw bytes but no channels", ErrCorrupt, rawLen)
+		}
+		return nil
+	}
+	interleaved, err := normalizeLayout(slots, interleaved)
+	if err != nil {
+		return err
+	}
+	cols := make([]int64, len(slots))
+	sizes := make([]int64, len(slots))
+	var chunk int64
+	var stride int64
+	for i, s := range slots {
+		if s.n > int64(math.MaxInt) {
+			return fmt.Errorf("%w: chunk has more values than int", ErrUnsupported)
+		}
+		ds, sz, err := slotBytes(s)
+		if err != nil {
+			return err
+		}
+		sizes[i] = ds
+		if interleaved {
+			cols[i] = stride
+			stride, err = add64(stride, int64(sz))
+			if err != nil {
+				return err
+			}
+		} else {
+			cols[i] = chunk
+		}
+		chunk, err = add64(chunk, ds)
+		if err != nil {
+			return err
+		}
+	}
+	if chunk == 0 {
+		if rawLen != 0 {
+			return fmt.Errorf("%w: empty chunk size with %d raw bytes", ErrCorrupt, rawLen)
+		}
+		return nil
+	}
+	if rawLen%chunk != 0 && !incomplete {
+		return fmt.Errorf("%w: raw length %d is not a multiple of chunk size %d", ErrCorrupt, rawLen, chunk)
+	}
+	nChunks := rawLen / chunk
+	rem := rawLen % chunk
+	partialN := make([]int64, len(slots))
+	partialPos := make([]int64, len(slots))
+	if rem > 0 {
+		base, err := add64(dataPos, mustMul(nChunks, chunk))
+		if err != nil {
+			return err
+		}
+		if interleaved {
+			if stride <= 0 {
+				return ErrCorrupt
+			}
+			extra := rem / stride
+			for i := range slots {
+				partialN[i] = extra
+				partialPos[i] = base
+			}
+		} else {
+			left := rem
+			at := base
+			for i, s := range slots {
+				if s.dt == TypeString {
+					if sizes[i] == 0 || left < sizes[i] {
+						break
+					}
+					partialN[i] = s.n
+					partialPos[i] = at
+					at += sizes[i]
+					left -= sizes[i]
+					continue
+				}
+				sz, ok := s.dt.Size()
+				if !ok || sz == 0 {
+					break
+				}
+				can := left / int64(sz)
+				if can > s.n {
+					can = s.n
+				}
+				partialN[i] = can
+				partialPos[i] = at
+				used := can * int64(sz)
+				at += used
+				left -= used
+				if can < s.n {
+					break
+				}
+			}
+		}
+	}
+	for i, s := range slots {
+		sp := span{
+			dataPos:    dataPos,
+			chunkSize:  chunk,
+			nChunks:    nChunks,
+			nPerChunk:  s.n,
+			col:        cols[i],
+			typeSize:   0,
+			big:        big,
+			str:        s.dt == TypeString,
+			strSize:    sizes[i],
+			partialN:   partialN[i],
+			partialPos: partialPos[i],
+		}
+		if sp.str {
+			// String blocks are contiguous per channel even when a single
+			// string channel carries kTocInterleavedData.
+		} else {
+			sz, _ := s.dt.Size()
+			sp.typeSize = sz
+			if interleaved {
+				sp.stride = stride
+				sp.partialCol = cols[i]
+				sp.partialStride = stride
+			} else {
+				sp.stride = int64(sz)
+				sp.partialStride = int64(sz)
+			}
+		}
+		full, err := mul64(nChunks, s.n)
+		if err != nil {
+			return err
+		}
+		add, err := add64(full, partialN[i])
+		if err != nil {
+			return err
+		}
+		s.ch.total, err = add64(s.ch.total, add)
+		if err != nil {
+			return err
+		}
+		s.ch.spans = append(s.ch.spans, sp)
+	}
+	return nil
+}
+
+func mustMul(a, b int64) int64 {
+	v, err := mul64(a, b)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+func slotBytes(s rawSlot) (int64, int, error) {
+	if s.dt == TypeString {
+		if s.n > 0 && uint64(s.total)/4 < uint64(s.n) {
+			return 0, 0, ErrCorrupt
+		}
+		return s.total, 0, nil
+	}
+	if s.dt == TypeVoid || s.n == 0 {
+		return 0, 0, nil
+	}
+	sz, ok := s.dt.Size()
+	if !ok {
+		return 0, 0, fmt.Errorf("%w: %s", ErrUnsupported, s.dt)
+	}
+	ds, err := mul64(s.n, int64(sz))
+	return ds, sz, err
+}
+
+// normalizeLayout checks the interleaved flag. A single string channel written
+// with the flag set is read as a contiguous offset table; the NI string layout
+// has no per-sample interleave. Mixed string/fixed or several string channels
+// with the flag set return ErrLayout.
+func normalizeLayout(slots []rawSlot, interleaved bool) (bool, error) {
+	if !interleaved {
+		return false, nil
+	}
+	var nref int64 = -1
+	unsized, sized := 0, 0
+	for _, s := range slots {
+		if s.n == 0 {
+			continue
+		}
+		if nref < 0 {
+			nref = s.n
+		} else if s.n != nref {
+			return false, fmt.Errorf("%w: interleaved channels have different lengths", ErrLayout)
+		}
+		if s.dt == TypeString {
+			unsized++
+		} else {
+			sized++
+		}
+	}
+	if unsized > 0 && (sized > 0 || unsized > 1) {
+		return false, fmt.Errorf("%w: string channels are not byte-interleaved; the offset table is per channel", ErrLayout)
+	}
+	if unsized == 1 && sized == 0 {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (f *File) ensureGroup(name string) *Group {
+	if i, ok := f.gindex[name]; ok {
+		return f.groups[i]
+	}
+	g := &Group{file: f, name: name, chIndex: map[string]int{}}
+	f.gindex[name] = len(f.groups)
+	f.groups = append(f.groups, g)
+	return g
+}
+
+func (f *File) ensureChannel(group, name string) *Channel {
+	g := f.ensureGroup(group)
+	if i, ok := g.chIndex[name]; ok {
+		return g.channels[i]
+	}
+	ch := &Channel{
+		file:  f,
+		group: g,
+		name:  name,
+		path:  channelPath(group, name),
+	}
+	g.chIndex[name] = len(g.channels)
+	g.channels = append(g.channels, ch)
+	f.byPath[ch.path] = ch
+	return ch
+}
+
+func (c *Channel) readPacked(start, n, size int) ([]byte, error) {
+	dst := make([]byte, n*size)
+	filled := 0
+	need := n
+	pos := int64(start)
+	for i := range c.spans {
+		if need == 0 {
+			break
+		}
+		sp := &c.spans[i]
+		avail, err := add64(mustMul(sp.nChunks, sp.nPerChunk), sp.partialN)
+		if err != nil {
+			return nil, err
+		}
+		if pos >= avail {
+			pos -= avail
+			continue
+		}
+		take := avail - pos
+		if take > int64(need) {
+			take = int64(need)
+		}
+		region := dst[filled*size : (filled+int(take))*size]
+		if err := sp.copyValues(c.file.r, pos, take, region); err != nil {
+			return nil, err
+		}
+		normalize(c.dt, region, sp.big)
+		filled += int(take)
+		need -= int(take)
+		pos = 0
+	}
+	if need != 0 {
+		return nil, ErrCorrupt
+	}
+	return dst, nil
+}
+
+func (sp *span) copyValues(r io.ReaderAt, start, n int64, dst []byte) error {
+	full, err := mul64(sp.nChunks, sp.nPerChunk)
+	if err != nil {
+		return err
+	}
+	dstOff := 0
+	if start < full {
+		take := n
+		if start+take > full {
+			take = full - start
+		}
+		if err := sp.copyFull(r, start, take, dst[dstOff:]); err != nil {
+			return err
+		}
+		dstOff += int(take) * sp.typeSize
+		n -= take
+		start += take
+	}
+	if n > 0 {
+		within := start - full
+		return copyStrided(r, sp.partialPos, sp.partialCol, sp.partialStride, within, n, dst[dstOff:], sp.typeSize)
+	}
+	return nil
+}
+
+func (sp *span) copyFull(r io.ReaderAt, start, n int64, dst []byte) error {
+	if sp.nPerChunk <= 0 {
+		return ErrCorrupt
+	}
+	left := n
+	idx := start
+	dstOff := 0
+	for left > 0 {
+		chunk := idx / sp.nPerChunk
+		within := idx % sp.nPerChunk
+		avail := sp.nPerChunk - within
+		if avail > left {
+			avail = left
+		}
+		base, err := add64(sp.dataPos, mustMul(chunk, sp.chunkSize))
+		if err != nil {
+			return err
+		}
+		if err := copyStrided(r, base, sp.col, sp.stride, within, avail, dst[dstOff:], sp.typeSize); err != nil {
+			return err
+		}
+		idx += avail
+		left -= avail
+		dstOff += int(avail) * sp.typeSize
+	}
+	return nil
+}
+
+func copyStrided(r io.ReaderAt, region, col, stride, within, count int64, dst []byte, size int) error {
+	if count == 0 {
+		return nil
+	}
+	if size <= 0 || stride <= 0 {
+		return ErrCorrupt
+	}
+	start, err := add64(region, col)
+	if err != nil {
+		return err
+	}
+	delta, err := mul64(within, stride)
+	if err != nil {
+		return err
+	}
+	start, err = add64(start, delta)
+	if err != nil {
+		return err
+	}
+	if stride == int64(size) {
+		nbytes, err := mul64(count, int64(size))
+		if err != nil {
+			return err
+		}
+		return readFull(r, dst[:nbytes], start)
+	}
+	spanBytes, err := mul64(count-1, stride)
+	if err != nil {
+		return err
+	}
+	spanBytes, err = add64(spanBytes, int64(size))
+	if err != nil {
+		return err
+	}
+	buf := make([]byte, spanBytes)
+	if err := readFull(r, buf, start); err != nil {
+		return err
+	}
+	for i := int64(0); i < count; i++ {
+		src, err := mul64(i, stride)
+		if err != nil {
+			return err
+		}
+		copy(dst[int(i)*size:(int(i)+1)*size], buf[src:src+int64(size)])
+	}
+	return nil
+}
+
+func (c *Channel) readStrings(start, n int) ([]string, error) {
+	out := make([]string, n)
+	dst := 0
+	need := n
+	pos := start
+	for i := range c.spans {
+		if need == 0 {
+			break
+		}
+		sp := &c.spans[i]
+		spanN64, err := add64(mustMul(sp.nChunks, sp.nPerChunk), sp.partialN)
+		if err != nil {
+			return nil, err
+		}
+		spanN := int(spanN64)
+		if pos >= spanN {
+			pos -= spanN
+			continue
+		}
+		if sp.nPerChunk == 0 {
+			return nil, ErrCorrupt
+		}
+		chunk := pos / int(sp.nPerChunk)
+		local := pos % int(sp.nPerChunk)
+		for need > 0 && int64(chunk) < sp.nChunks {
+			strs, err := sp.loadChunkStrings(c.file.r, int64(chunk))
+			if err != nil {
+				return nil, err
+			}
+			take := len(strs) - local
+			if take > need {
+				take = need
+			}
+			copy(out[dst:], strs[local:local+take])
+			dst += take
+			need -= take
+			local = 0
+			chunk++
+		}
+		if need > 0 && sp.partialN > 0 && int64(chunk) >= sp.nChunks {
+			strs, err := sp.loadBlock(c.file.r, sp.partialPos)
+			if err != nil {
+				return nil, err
+			}
+			// partialPos for a contiguous string is the block itself.
+			if local > len(strs) {
+				return nil, ErrCorrupt
+			}
+			take := len(strs) - local
+			if take > need {
+				take = need
+			}
+			copy(out[dst:], strs[local:local+take])
+			dst += take
+			need -= take
+		}
+		pos = 0
+	}
+	if need != 0 {
+		return nil, ErrCorrupt
+	}
+	return out, nil
+}
+
+func (sp *span) loadChunkStrings(r io.ReaderAt, chunk int64) ([]string, error) {
+	base, err := add64(sp.dataPos, mustMul(chunk, sp.chunkSize))
+	if err != nil {
+		return nil, err
+	}
+	off, err := add64(base, sp.col)
+	if err != nil {
+		return nil, err
+	}
+	return sp.loadBlock(r, off)
+}
+
+func (sp *span) loadBlock(r io.ReaderAt, off int64) ([]string, error) {
+	if sp.strSize < 0 || sp.strSize > int64(math.MaxInt) {
+		return nil, ErrCorrupt
+	}
+	buf := make([]byte, sp.strSize)
+	if err := readFull(r, buf, off); err != nil {
+		return nil, err
+	}
+	var bo binary.ByteOrder = binary.LittleEndian
+	if sp.big {
+		bo = binary.BigEndian
+	}
+	return decodeStrings(buf, int(sp.nPerChunk), bo)
+}
+
+func copyProps(in []Property) []Property {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]Property, len(in))
+	copy(out, in)
+	return out
+}
+
+func findProp(props []Property, name string) (Property, bool) {
+	for i := len(props) - 1; i >= 0; i-- {
+		if props[i].Name == name {
+			return props[i], true
+		}
+	}
+	return Property{}, false
+}
+
+func upsert(props *[]Property, p Property) {
+	for i := range *props {
+		if (*props)[i].Name == p.Name {
+			(*props)[i] = p
+			return
+		}
+	}
+	*props = append(*props, p)
+}
+
+func emptyOf(dt DataType) (any, error) {
+	if dt == TypeString {
+		return []string{}, nil
+	}
+	if _, ok := dt.Size(); !ok {
+		return nil, nil
+	}
+	return decodePacked(dt, nil)
+}
+
+func sliceLen(v any) int {
+	switch s := v.(type) {
+	case []int8:
+		return len(s)
+	case []int16:
+		return len(s)
+	case []int32:
+		return len(s)
+	case []int64:
+		return len(s)
+	case []uint8:
+		return len(s)
+	case []uint16:
+		return len(s)
+	case []uint32:
+		return len(s)
+	case []uint64:
+		return len(s)
+	case []float32:
+		return len(s)
+	case []float64:
+		return len(s)
+	case []bool:
+		return len(s)
+	case []string:
+		return len(s)
+	case []Timestamp:
+		return len(s)
+	case []Extended:
+		return len(s)
+	case []complex64:
+		return len(s)
+	case []complex128:
+		return len(s)
+	default:
+		return 0
+	}
+}
