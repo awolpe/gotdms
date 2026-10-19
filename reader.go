@@ -17,6 +17,7 @@ type File struct {
 	size    int64
 	version uint32
 	segs    int
+	readBuf int
 
 	props  []Property
 	groups []*Group
@@ -107,9 +108,21 @@ func Open(path string) (*File, error) {
 // either with a Size method (bytes.Reader, io.SectionReader), as an *os.File,
 // or as an io.Seeker. Metadata is parsed now; raw samples stay on r until a
 // channel read. NewReader does not close r.
-func NewReader(r io.ReaderAt) (*File, error) {
+//
+// Optional ReaderOptions configure the sequential buffer Cursor uses.
+// Values keeps using ReadAt and ignores that buffer.
+func NewReader(r io.ReaderAt, opts ...ReaderOption) (*File, error) {
 	if r == nil {
 		return nil, wrap("open", "", fmt.Errorf("%w: nil reader", ErrArgument))
+	}
+	cfg := readerConfig{bufSize: DefaultReadBuffer}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	if cfg.bufSize <= 0 {
+		cfg.bufSize = DefaultReadBuffer
 	}
 	sz, err := readerSize(r)
 	if err != nil {
@@ -119,10 +132,11 @@ func NewReader(r io.ReaderAt) (*File, error) {
 		return nil, wrap("open", "", ErrCorrupt)
 	}
 	f := &File{
-		r:      r,
-		size:   sz,
-		gindex: map[string]int{},
-		byPath: map[string]*Channel{},
+		r:       r,
+		size:    sz,
+		readBuf: cfg.bufSize,
+		gindex:  map[string]int{},
+		byPath:  map[string]*Channel{},
 	}
 	if err := f.parse(); err != nil {
 		return nil, err
@@ -221,6 +235,24 @@ func (c *Channel) Properties() []Property { return copyProps(c.props) }
 // Property looks up a channel property by name.
 func (c *Channel) Property(name string) (Property, bool) { return findProp(c.props, name) }
 
+// Slice reads n raw values beginning at sample i.
+//
+// The concrete type matches Values. The returned slice is newly allocated.
+// i and n are sample indexes, not bytes. i >= 0, n >= 0, and i+n <= Len.
+//
+// Contiguous channels are read with ReadAt at the byte offset of sample i.
+// Interleaved channels start at the multiplexed window that contains sample
+// i; the bytes before that window are not read. String channels read the
+// offset-table entries that bound [i, i+n) and copy only those string bytes.
+// Earlier chunks are not decoded. A string window does not re-check that the
+// offset table consumes the whole chunk; Values still does, for a full chunk.
+func (c *Channel) Slice(i, n int) (any, error) {
+	if c == nil {
+		return nil, wrap("read", "", fmt.Errorf("%w: nil channel", ErrArgument))
+	}
+	return c.readRange(i, n)
+}
+
 // Values reads every raw value. The concrete type is:
 //
 //	TypeInt8 []int8, TypeInt16 []int16, TypeInt32 []int32, TypeInt64 []int64,
@@ -237,23 +269,61 @@ func (c *Channel) Values() (any, error) {
 	return c.readRange(0, c.Len())
 }
 
-// Cursor returns a batching reader. batch is the maximum number of values
-// Next yields; non-positive batch selects 4096. The slices returned by Values
-// are valid until the next Next call.
+// Cursor returns a batching reader over the whole channel. batch is the
+// maximum number of values Next yields; non-positive batch selects 4096.
+// The slices returned by Values are valid until the next Next call.
+// Close returns the sequential buffer if the scan stops early.
 func (c *Channel) Cursor(batch int) *Cursor {
 	if batch <= 0 {
 		batch = 4096
 	}
-	return &Cursor{ch: c, batch: batch}
+	return &Cursor{ch: c, batch: batch, end: -1}
+}
+
+// CursorAt returns a Cursor over the half-open sample range [i, i+n).
+// batch is the maximum number of values Next yields; non-positive batch
+// selects 4096. Seeking matches Slice: contiguous channels ReadAt at sample
+// i, and interleaved channels start at that sample's multiplexed window.
+// A range that does not fit in the channel fails on the first Next.
+func (c *Channel) CursorAt(i, n, batch int) *Cursor {
+	cur := c.Cursor(batch)
+	if c == nil {
+		cur.err = wrap("read", "", fmt.Errorf("%w: nil channel", ErrArgument))
+		cur.end = 0
+		return cur
+	}
+	if i < 0 || n < 0 || int64(i) > c.total || int64(n) > c.total-int64(i) {
+		cur.err = wrap("read", c.path, fmt.Errorf("%w: range %d:%d of %d", ErrArgument, i, n, c.total))
+		cur.end = 0
+		cur.pos = 0
+		return cur
+	}
+	cur.pos = i
+	cur.end = i + n
+	return cur
 }
 
 // Cursor streams one channel in batches without retaining earlier batches.
+//
+// Next reads a contiguous fixed-size batch of at least 32 KiB with ReadAt
+// straight into the reused slice. Smaller batches, and interleaved or
+// non-native channels, go through a sequential buffer (see WithReadBuffer)
+// so a scan does not issue a ReadAt per batch. The slice returned by Values
+// is valid until the next Next call; the cursor reuses its backing array.
+// Close returns that buffer early. Concurrent Next calls on one cursor are
+// not safe. Concurrent cursors on one file are safe when the underlying
+// ReaderAt is.
+//
+// To timestamp batches as a waveform, take WaveformHeader once and call
+// TimeAt with the absolute sample index. Waveform loads the whole channel.
 type Cursor struct {
 	ch    *Channel
 	batch int
 	pos   int
+	end   int // exclusive end; negative means the channel length
 	cur   any
 	err   error
+	seq   *seqReader
 }
 
 // Next loads the next batch. It returns false at the end or after an error.
@@ -262,23 +332,109 @@ func (cur *Cursor) Next() bool {
 	if cur.err != nil || cur.ch == nil {
 		return false
 	}
-	if cur.pos >= cur.ch.Len() {
+	lim := cur.limit()
+	if cur.pos >= lim {
 		cur.cur = nil
+		cur.release()
 		return false
 	}
 	n := cur.batch
-	if cur.pos+n > cur.ch.Len() {
-		n = cur.ch.Len() - cur.pos
+	if cur.pos+n > lim {
+		n = lim - cur.pos
 	}
-	v, err := cur.ch.readRange(cur.pos, n)
+	r, err := cur.reader()
 	if err != nil {
 		cur.err = wrap("read", cur.ch.path, err)
 		cur.cur = nil
+		cur.release()
 		return false
 	}
-	cur.cur = v
+	if err := cur.refill(r, n); err != nil {
+		cur.err = wrap("read", cur.ch.path, err)
+		cur.cur = nil
+		cur.release()
+		return false
+	}
 	cur.pos += n
+	if cur.pos >= lim {
+		cur.release()
+	}
 	return true
+}
+
+func (cur *Cursor) limit() int {
+	if cur.end < 0 {
+		if cur.ch == nil {
+			return 0
+		}
+		return cur.ch.Len()
+	}
+	return cur.end
+}
+
+func (cur *Cursor) reader() (io.ReaderAt, error) {
+	if cur.ch.file == nil || cur.ch.file.r == nil {
+		return nil, ErrClosed
+	}
+	if cur.directRead() {
+		return cur.ch.file.r, nil
+	}
+	if cur.seq == nil {
+		cur.seq = newSeqReader(cur.ch.file.r, cur.ch.file.readBuf)
+	}
+	return cur.seq, nil
+}
+
+// directRead reports whether this cursor should ReadAt into the batch.
+// The decision uses the configured batch, so a short final batch follows
+// the same path as the rest of the scan.
+func (cur *Cursor) directRead() bool {
+	if contigDirect == 0 || cur.ch == nil || !cur.ch.contiguousBytes() || !fixedNativeDT(cur.ch.dt) {
+		return false
+	}
+	if contigDirect == 2 {
+		return true
+	}
+	sz, ok := cur.ch.dt.Size()
+	if !ok || sz <= 0 || cur.batch <= 0 || cur.batch > math.MaxInt/sz {
+		return false
+	}
+	nbytes := cur.batch * sz
+	buf := DefaultReadBuffer
+	if cur.ch.file != nil && cur.ch.file.readBuf > 0 {
+		buf = cur.ch.file.readBuf
+	}
+	// A batch at least as large as the sequential buffer would skip it and
+	// still pay for the allocation. Smaller batches won against the default
+	// 256 KiB buffer once they reached 32 KiB; a larger custom buffer keeps
+	// those batches on the buffered path.
+	if nbytes >= buf {
+		return true
+	}
+	return buf <= DefaultReadBuffer && nbytes >= cursorDirectMin
+}
+
+func (cur *Cursor) release() {
+	if cur.seq != nil {
+		cur.seq.release()
+		cur.seq = nil
+	}
+}
+
+// Close returns the cursor's sequential buffer to the pool. Next after Close
+// reports the end of the scan. Close is safe to call more than once. A scan
+// that runs to completion, and a Next that fails, also return the buffer.
+// Dropping a cursor without Close still returns a pooled buffer when the
+// cursor is garbage-collected.
+func (cur *Cursor) Close() {
+	if cur == nil {
+		return
+	}
+	cur.release()
+	if cur.ch != nil && cur.err == nil {
+		cur.pos = cur.limit()
+	}
+	cur.cur = nil
 }
 
 // Err returns the error from the last Next, or nil.
@@ -291,9 +447,33 @@ func (cur *Cursor) Values() any { return cur.cur }
 func (cur *Cursor) Len() int { return sliceLen(cur.cur) }
 
 // Float64s converts the current batch with the same rules as Channel.Float64s.
+//
+// On a float64 channel the result is the cursor's reused batch. That slice
+// aliases Values and is overwritten by the next Next, and cleared by Close.
+// It is not safe to retain. Use Float64sCopy to keep an independent copy.
 func (cur *Cursor) Float64s() ([]float64, error) {
 	if cur.cur == nil {
 		return nil, wrap("read", cur.ch.path, ErrArgument)
+	}
+	return toFloat64s(cur.cur)
+}
+
+// Float64sCopy returns an independent []float64 of the current batch.
+// The result stays valid after Next and Close. On a float64 channel this
+// copies the reused batch; other numeric channels already allocate in
+// Float64s, and Copy returns that new slice (it does not alias the batch).
+func (cur *Cursor) Float64sCopy() ([]float64, error) {
+	if cur == nil || cur.cur == nil {
+		path := ""
+		if cur != nil && cur.ch != nil {
+			path = cur.ch.path
+		}
+		return nil, wrap("read", path, ErrArgument)
+	}
+	if s, ok := cur.cur.([]float64); ok {
+		out := make([]float64, len(s))
+		copy(out, s)
+		return out, nil
 	}
 	return toFloat64s(cur.cur)
 }
@@ -302,6 +482,10 @@ func (c *Channel) readRange(start, n int) (any, error) {
 	if c.file == nil || c.file.r == nil {
 		return nil, wrap("read", c.path, ErrClosed)
 	}
+	return c.readRangeFrom(c.file.r, start, n, nil)
+}
+
+func (c *Channel) readRangeFrom(r io.ReaderAt, start, n int, reuse any) (any, error) {
 	if start < 0 || n < 0 || int64(start) > c.total || int64(n) > c.total-int64(start) {
 		return nil, wrap("read", c.path, fmt.Errorf("%w: range %d:%d of %d", ErrArgument, start, n, c.total))
 	}
@@ -315,7 +499,7 @@ func (c *Channel) readRange(start, n int) (any, error) {
 		if n == 0 {
 			return []string{}, nil
 		}
-		s, err := c.readStrings(start, n)
+		s, err := c.readStrings(r, start, n)
 		if err != nil {
 			return nil, wrap("read", c.path, err)
 		}
@@ -325,11 +509,17 @@ func (c *Channel) readRange(start, n int) (any, error) {
 		v, err := emptyOf(c.dt)
 		return v, wrap("read", c.path, err)
 	}
+	if v, ok, err := c.readFast(r, start, n, reuse); ok || err != nil {
+		if err != nil {
+			return nil, wrap("read", c.path, err)
+		}
+		return v, nil
+	}
 	sz, ok := c.dt.Size()
 	if !ok {
 		return nil, wrap("read", c.path, fmt.Errorf("%w: %s", ErrUnsupported, c.dt))
 	}
-	buf, err := c.readPacked(start, n, sz)
+	buf, err := c.readPacked(r, start, n, sz)
 	if err != nil {
 		return nil, wrap("read", c.path, err)
 	}
@@ -668,6 +858,15 @@ func parseFullIndex(body []byte, bo binary.ByteOrder) (DataType, int64, int64, e
 		if n > 0 && uint64(total)/4 < uint64(n) {
 			return 0, 0, 0, fmt.Errorf("%w: string total size %d too small for %d offsets", ErrCorrupt, total, n)
 		}
+		// Offsets are uint32. A table past 4 GiB, or a payload past 4 GiB,
+		// cannot be addressed and is rejected before any buffer is allocated.
+		if n > int64(math.MaxUint32/4) {
+			return 0, 0, 0, fmt.Errorf("%w: string offset table longer than 4 GiB", ErrCorrupt)
+		}
+		table := uint64(n) * 4
+		if uint64(total) >= table && uint64(total)-table > math.MaxUint32 {
+			return 0, 0, 0, fmt.Errorf("%w: string block longer than 4 GiB", ErrCorrupt)
+		}
 		return dt, n, total, nil
 	default:
 		sz, ok := dt.Size()
@@ -931,39 +1130,10 @@ func (f *File) ensureChannel(group, name string) *Channel {
 	return ch
 }
 
-func (c *Channel) readPacked(start, n, size int) ([]byte, error) {
+func (c *Channel) readPacked(r io.ReaderAt, start, n, size int) ([]byte, error) {
 	dst := make([]byte, n*size)
-	filled := 0
-	need := n
-	pos := int64(start)
-	for i := range c.spans {
-		if need == 0 {
-			break
-		}
-		sp := &c.spans[i]
-		avail, err := add64(mustMul(sp.nChunks, sp.nPerChunk), sp.partialN)
-		if err != nil {
-			return nil, err
-		}
-		if pos >= avail {
-			pos -= avail
-			continue
-		}
-		take := avail - pos
-		if take > int64(need) {
-			take = int64(need)
-		}
-		region := dst[filled*size : (filled+int(take))*size]
-		if err := sp.copyValues(c.file.r, pos, take, region); err != nil {
-			return nil, err
-		}
-		normalize(c.dt, region, sp.big)
-		filled += int(take)
-		need -= int(take)
-		pos = 0
-	}
-	if need != 0 {
-		return nil, ErrCorrupt
+	if err := c.fillPacked(r, start, n, size, dst); err != nil {
+		return nil, err
 	}
 	return dst, nil
 }
@@ -1047,29 +1217,51 @@ func copyStrided(r io.ReaderAt, region, col, stride, within, count int64, dst []
 		}
 		return readFull(r, dst[:nbytes], start)
 	}
-	spanBytes, err := mul64(count-1, stride)
-	if err != nil {
-		return err
-	}
-	spanBytes, err = add64(spanBytes, int64(size))
-	if err != nil {
-		return err
-	}
-	buf := make([]byte, spanBytes)
-	if err := readFull(r, buf, start); err != nil {
-		return err
-	}
-	for i := int64(0); i < count; i++ {
-		src, err := mul64(i, stride)
+	// De-interleave in windows so a channel read does not allocate the whole
+	// multiplexed span. Sample i of this channel sits at byte i*stride.
+	done := int64(0)
+	for done < count {
+		maxTake := int64(1)
+		if int64(size) < strideChunk && stride > 0 {
+			maxTake = (strideChunk-int64(size))/stride + 1
+			if maxTake < 1 {
+				maxTake = 1
+			}
+		}
+		take := count - done
+		if take > maxTake {
+			take = maxTake
+		}
+		spanBytes, err := mul64(take-1, stride)
 		if err != nil {
 			return err
 		}
-		copy(dst[int(i)*size:(int(i)+1)*size], buf[src:src+int64(size)])
+		spanBytes, err = add64(spanBytes, int64(size))
+		if err != nil {
+			return err
+		}
+		buf := borrowScratch(int(spanBytes))
+		err = readFull(r, buf[:spanBytes], start)
+		if err != nil {
+			releaseScratch(buf)
+			return err
+		}
+		deinterleave(dst[int(done)*size:], buf, size, int(stride), int(take))
+		releaseScratch(buf)
+		step, err := mul64(take, stride)
+		if err != nil {
+			return err
+		}
+		start, err = add64(start, step)
+		if err != nil {
+			return err
+		}
+		done += take
 	}
 	return nil
 }
 
-func (c *Channel) readStrings(start, n int) ([]string, error) {
+func (c *Channel) readStrings(r io.ReaderAt, start, n int) ([]string, error) {
 	out := make([]string, n)
 	dst := 0
 	need := n
@@ -1094,22 +1286,26 @@ func (c *Channel) readStrings(start, n int) ([]string, error) {
 		chunk := pos / int(sp.nPerChunk)
 		local := pos % int(sp.nPerChunk)
 		for need > 0 && int64(chunk) < sp.nChunks {
-			strs, err := sp.loadChunkStrings(c.file.r, int64(chunk))
-			if err != nil {
-				return nil, err
+			avail := int(sp.nPerChunk) - local
+			if avail < 0 {
+				return nil, ErrCorrupt
 			}
-			take := len(strs) - local
+			take := avail
 			if take > need {
 				take = need
 			}
-			copy(out[dst:], strs[local:local+take])
-			dst += take
-			need -= take
+			strs, err := sp.loadStringsAt(r, int64(chunk), local, take)
+			if err != nil {
+				return nil, err
+			}
+			copy(out[dst:], strs)
+			dst += len(strs)
+			need -= len(strs)
 			local = 0
 			chunk++
 		}
 		if need > 0 && sp.partialN > 0 && int64(chunk) >= sp.nChunks {
-			strs, err := sp.loadBlock(c.file.r, sp.partialPos)
+			strs, err := sp.loadBlock(r, sp.partialPos)
 			if err != nil {
 				return nil, err
 			}
@@ -1133,7 +1329,7 @@ func (c *Channel) readStrings(start, n int) ([]string, error) {
 	return out, nil
 }
 
-func (sp *span) loadChunkStrings(r io.ReaderAt, chunk int64) ([]string, error) {
+func (sp *span) loadStringsAt(r io.ReaderAt, chunk int64, local, take int) ([]string, error) {
 	base, err := add64(sp.dataPos, mustMul(chunk, sp.chunkSize))
 	if err != nil {
 		return nil, err
@@ -1142,7 +1338,89 @@ func (sp *span) loadChunkStrings(r io.ReaderAt, chunk int64) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return sp.loadBlock(r, off)
+	// A full chunk keeps the strict "offsets consume the block" check.
+	// A window reads only the offset entries and payload bytes it returns.
+	if local == 0 && int64(take) == sp.nPerChunk {
+		return sp.loadBlock(r, off)
+	}
+	return sp.loadStringWindow(r, off, int(sp.nPerChunk), local, take)
+}
+
+// loadStringWindow reads strings [local, local+take) from the block at off.
+// It reads the uint32 end-offsets that bound the window and the payload
+// between them, not the earlier string bytes.
+func (sp *span) loadStringWindow(r io.ReaderAt, off int64, nAll, local, take int) ([]string, error) {
+	if take == 0 {
+		return []string{}, nil
+	}
+	if local < 0 || take < 0 || nAll < 0 || local > nAll || take > nAll-local {
+		return nil, ErrCorrupt
+	}
+	if sp.strSize < 0 {
+		return nil, ErrCorrupt
+	}
+	table := int64(nAll) * 4
+	if table > sp.strSize {
+		return nil, ErrCorrupt
+	}
+	var bo binary.ByteOrder = binary.LittleEndian
+	if sp.big {
+		bo = binary.BigEndian
+	}
+	var start uint32
+	if local > 0 {
+		var b [4]byte
+		if err := readFull(r, b[:], off+int64(local-1)*4); err != nil {
+			return nil, err
+		}
+		start = bo.Uint32(b[:])
+	}
+	offs := make([]byte, 4*take)
+	if err := readFull(r, offs, off+int64(local)*4); err != nil {
+		return nil, err
+	}
+	ends := make([]uint32, take)
+	prev := start
+	var end uint32
+	for i := 0; i < take; i++ {
+		end = bo.Uint32(offs[i*4:])
+		if end < prev {
+			return nil, ErrCorrupt
+		}
+		ends[i] = end
+		prev = end
+	}
+	payload := sp.strSize - table
+	if int64(end) > payload {
+		return nil, ErrCorrupt
+	}
+	nbytes := int(end - start)
+	buf := make([]byte, nbytes)
+	if nbytes > 0 {
+		dataAt, err := add64(off, table)
+		if err != nil {
+			return nil, err
+		}
+		dataAt, err = add64(dataAt, int64(start))
+		if err != nil {
+			return nil, err
+		}
+		if err := readFull(r, buf, dataAt); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]string, take)
+	prev = start
+	for i := 0; i < take; i++ {
+		a := int(prev - start)
+		b := int(ends[i] - start)
+		if a < 0 || b < a || b > len(buf) {
+			return nil, ErrCorrupt
+		}
+		out[i] = string(buf[a:b])
+		prev = ends[i]
+	}
+	return out, nil
 }
 
 func (sp *span) loadBlock(r io.ReaderAt, off int64) ([]string, error) {
