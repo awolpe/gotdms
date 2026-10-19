@@ -277,6 +277,10 @@ for _, s := range series {
 
 `Example` in package `dataset` is the compile-checked copy: 100 files, a global timestamp channel, find without a group, one window, and relative times against an explicit trigger. Benchmarks run only under `go test -bench`. `BenchmarkCatalog` indexes 100 one-sample files. `BenchmarkCatalogSharedClock` and `BenchmarkReadManySharedClock` use a 2^20-sample clock. `BenchmarkReadWindowTail` times the same clock's last 64 samples and still decodes the prefix; it is the cost of having no core range read, not a fast path.
 
+## Python
+
+`bridge/` is a self-contained Go module and Python client so a numpy and Polars tool can stop importing npTDMS. The bridge links Apache Arrow. The core module stays dependency-free. Interactive sessions and `gotdms-bridge convert` both return raw samples unless scaling is requested. Polars frames use a `time` column, because Polars has no row index. The mapping, the license note, and the remaining gaps are in [bridge/docs/nptdms-migration.md](bridge/docs/nptdms-migration.md). That directory is structured to be lifted out as its own repository.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
