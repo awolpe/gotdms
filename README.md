@@ -244,6 +244,39 @@ The numbers below are the median of three `-benchtime=1x` runs on one KVM virtua
 
 `format.go` is the lead-in. `datatype.go` is the type enum. `value.go` encodes properties and channel blocks. `reader.go` is the segment walk and `ReadAt` fetches. `writer.go` is segment assembly. Tests in `golden_test.go` build files with `encoding/binary` and the hex from the NI article, without calling `Writer`, so a bug shared by the writer and the reader cannot satisfy them.
 
+## Datasets
+
+`github.com/trey-copeland/gotdms/dataset` reads a set of TDMS files as one catalog. You declare which channel carries time. Waveform properties are only a fallback, and an undeclared channel with no waveform timing is untimed on purpose.
+
+`WithTimestampChannelName("Time")` says every group has a timestamp channel of that name. `WithTimestampChannel(group, name)` overrides that for one group. An empty name opts the group out of the global name: that group does not use a timestamp channel, and waveform properties may still apply. A later call for the same group replaces the earlier one. The declared channel must be in the same group and file as the data and have the same sample count. If it is missing, the wrong length, or not a timestamp or numeric type, that data channel is untimed and catalog still succeeds. Find and Search mark the declared channel with `IsTimestamp`. It is not used as its own time source.
+
+Timestamp-typed channels are absolute times. Numeric channels (int or float) are seconds since `WithNumericEpoch`. There is no default epoch. Open fails if a declared timestamp channel is numeric and the epoch was not set, so a value of 0 is not silently treated as the Unix epoch. Pass `time.Unix(0, 0).UTC()` when the numbers are Unix seconds. The numeric epoch is not the plotting basis.
+
+Relative time is `sample_time - basis` in seconds. It is zero only at the basis, positive after, and negative before. `WithBasisTime` sets the dataset basis. If it is omitted, the basis is the earliest timed sample in the catalog, chosen once at `Open`. Cropping a window does not move it, so the first returned sample is not re-zeroed. `WithReadBasis` overrides that basis for one `Read`, `ReadWindow`, or `ReadMany`; `ReadMany` applies the same override to every series and leaves `Dataset.Basis` unchanged. `Series.Basis` is the basis that call used. `RelativeTimes` subtracts it. `RelativeTimesFrom` subtracts any other time and does not modify the series. The basis does not have to be a sample. An untimed series ignores it and returns sample indexes. `Resample` keeps absolute times and copies `Basis`.
+
+A step backwards in a timestamp channel returns `ErrMonotonic`. Equal timestamps stay in file order inside a file; across files they follow the overlap policy. The same channel name in several groups returns `*AmbiguousError` unless `Selector.Group` is set. Files are merged in time order. The window is half-open (`start <= t < end`). `OverlapKeepFirst` is the default. Gaps are reported and are not filled with NaN. `Resample` (`InterpLinear`, `InterpPrevious`) is opt-in and does not extrapolate.
+
+When a group has no timestamp declaration, `StartTime` and `Increment` (`wf_start_time`, `wf_increment`) supply the axis. Sample `i` is that start plus `i` times the increment, rounded to the nearest nanosecond. The core reader has no sample seek and does not export per-segment sample bounds, so a waveform window decodes from the first sample and stops at the window. A tail window still pays for the prefix. Declared timestamp values are decoded in full on read, because the times are the samples. Catalog reads the first two samples of a clock whose first step is positive and derives the span from that step; it does not scan the axis for monotonicity. Read returns `ErrMonotonic` if a later sample steps backwards. `ReadMany` opens each file once and decodes a shared timestamp channel once per call. `WithReadWorkers` caps how many files that call opens (default 4).
+
+```go
+ds, err := dataset.OpenGlob(dir, "*.tdms",
+    dataset.WithTimestampChannelName("Time"),
+    dataset.WithNumericEpoch(epoch),
+)
+_ = ds.Find("ai0") // group name not required
+trigger := epoch.Add(10500 * time.Millisecond) // not required to be a sample
+series, err := ds.ReadMany(
+    []dataset.Selector{{Name: "ai0"}, {Name: "ai1"}},
+    start, end,
+    dataset.WithReadBasis(trigger),
+)
+for _, s := range series {
+    _ = s.RelativeTimes() // seconds since trigger; negative before it
+}
+```
+
+`Example` in package `dataset` is the compile-checked copy: 100 files, a global timestamp channel, find without a group, one window, and relative times against an explicit trigger. Benchmarks run only under `go test -bench`. `BenchmarkCatalog` indexes 100 one-sample files. `BenchmarkCatalogSharedClock` and `BenchmarkReadManySharedClock` use a 2^20-sample clock. `BenchmarkReadWindowTail` times the same clock's last 64 samples and still decodes the prefix; it is the cost of having no core range read, not a fast path.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
