@@ -10,9 +10,10 @@ const (
 )
 
 type readerConfig struct {
-	bufSize      int
-	indexSidecar string
-	lenientTail  bool
+	bufSize            int
+	indexSidecar       string
+	indexTrustIdentity bool
+	lenientTail        bool
 }
 
 // ReaderOption configures NewReader.
@@ -66,12 +67,69 @@ func WithLenientTail() ReaderOption {
 // that pairing is ignored so the TDMS file is not overwritten. The conventional
 // path is SegmentIndexPath.
 //
-// The on-disk layout is little-endian, version 1, magic "GTDX". It is not an
-// NI *.tdms_index (TDSh) file. See SegmentIndexPath for the field list.
+// The on-disk layout is little-endian, version 2, magic "GTDX". Version 1
+// sidecars still open. It is not an NI *.tdms_index (TDSh) file. See
+// SegmentIndexPath for the field list.
+//
+// WithSegmentIndexTrustIdentity skips the fingerprint walk on a later open.
+// The default, with that option unset, still recomputes the fingerprint.
 func WithSegmentIndex(sidecar string) ReaderOption {
 	return func(c *readerConfig) {
 		c.indexSidecar = sidecar
 	}
+}
+
+// WithSegmentIndexTrustIdentity makes WithSegmentIndex accept a sidecar when
+// the data file's size, modification time in nanoseconds, device, and inode
+// match the header. The lead-in and metadata fingerprint is not recomputed.
+//
+// The default stays the full fingerprint check. Trust this only for files
+// whose bytes you know were not edited in place. An edit that preserves size
+// and modification time, and that does not replace the inode, is missed: the
+// object tree and spans come from the sidecar, not from the bytes now on
+// disk. Restoring the modification time with os.Chtimes after such an edit
+// is the usual way that happens. Changing the size or the modification time
+// is still a cache miss. Where the platform reports a device and inode,
+// replacing the file is a miss even when size and modification time were
+// copied onto the new file.
+//
+// On Windows the device and inode are the volume serial number and file
+// index from GetFileInformationByHandle, so a replaced file is a miss even
+// when size and modification time were copied onto it. On a platform that
+// still reports no device and inode, trust mode checks only size and
+// modification time, and both identity fields are stored as 0. FAT records
+// modification time in steps of 2 seconds, and exFAT in steps of 10
+// milliseconds, so two writes inside one step share a timestamp. An edit
+// that lands in the same step is missed, just as an edit whose timestamp
+// was restored is missed.
+//
+// Decode bounds checks stay in force. A span that addresses bytes outside
+// the file, or that claims more samples than the file can hold, is a decode
+// error and a cache miss. It is not an out-of-bounds read. Sample bytes are
+// still read from the file, so a raw-sample edit is visible when the cached
+// spans still address those bytes.
+//
+// The option does nothing unless WithSegmentIndex names a sidecar. It does
+// not change what BuildSegmentIndex writes. A sidecar whose final segment
+// was recovered with WithLenientTail is still a miss when this open is not
+// lenient, so a strict Open keeps returning ErrTruncated.
+func WithSegmentIndexTrustIdentity() ReaderOption {
+	return func(c *readerConfig) {
+		c.indexTrustIdentity = true
+	}
+}
+
+func applyReaderOptions(opts []ReaderOption) readerConfig {
+	cfg := readerConfig{bufSize: DefaultReadBuffer}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	if cfg.bufSize <= 0 {
+		cfg.bufSize = DefaultReadBuffer
+	}
+	return cfg
 }
 
 type writerConfig struct {

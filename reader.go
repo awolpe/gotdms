@@ -63,6 +63,10 @@ type Channel struct {
 	props []Property
 	idx   rawIndex
 	spans []span
+	// runs holds repeat records for spans whose runIdx is non-zero.
+	// Index 0 is unused. A nil slice means every span is one segment,
+	// which keeps the span itself free of pointers.
+	runs  []spanRun
 	total int64
 	daqmx *daqmxState
 }
@@ -93,20 +97,21 @@ type span struct {
 	col       int64
 	stride    int64
 	typeSize  int
-	big       bool
-
-	str     bool
-	strSize int64
+	strSize   int64
 
 	partialN      int64
 	partialPos    int64
 	partialCol    int64
 	partialStride int64
 
-	// digital extracts one bit from each stride. bit is that bit inside the
-	// byte at col (0 is the least significant bit). solo keeps the span out of
-	// the shared ReadValues window: col is an offset within the whole chunk,
-	// which is how a raw buffer after the first one is addressed.
+	// big is the segment's endianness. str marks a length-prefixed string
+	// block. digital extracts one bit from each stride. bit is that bit
+	// inside the byte at col (0 is the least significant bit). solo keeps
+	// the span out of the shared ReadValues window: col is an offset within
+	// the whole chunk, which is how a raw buffer after the first one is
+	// addressed.
+	big     bool
+	str     bool
 	digital bool
 	bit     uint8
 	solo    bool
@@ -117,6 +122,17 @@ type span struct {
 	// those samples. Follow skips them until a later open sees a finished
 	// lead-in.
 	live bool
+
+	// runIdx is 0 when this span is one segment. Otherwise it indexes the
+	// channel's run table. The index is not a pointer, so growing the span
+	// slice does not take a write barrier.
+	runIdx uint32
+}
+
+// spanRun is one merged run: count repeats of the span at dataPos+i*step.
+type spanRun struct {
+	count int64
+	step  int64
 }
 
 // Open opens the TDMS file at path. Optional ReaderOptions configure the
@@ -178,15 +194,21 @@ func newReader(r io.ReaderAt, path string, opts ...ReaderOption) (*File, error) 
 		gindex:  map[string]int{},
 		byPath:  map[string]*Channel{},
 	}
-	if cfg.indexSidecar != "" && f.trySegmentIndex(cfg.indexSidecar) {
-		return f, nil
+	var pre dataStat
+	if cfg.indexSidecar != "" {
+		// Stat the open handle, not the path, before any parse. The sidecar
+		// must describe the bytes this File reads.
+		pre, _ = f.statData()
+		if f.trySegmentIndex(cfg.indexSidecar, cfg.indexTrustIdentity, pre) {
+			return f, nil
+		}
 	}
 	if err := f.parse(); err != nil {
 		return nil, err
 	}
 	if cfg.indexSidecar != "" {
 		// A cache write failure leaves the open valid. The next open parses.
-		_ = f.writeSegmentIndex(cfg.indexSidecar)
+		_ = f.writeSegmentIndex(cfg.indexSidecar, pre)
 	}
 	return f, nil
 }
@@ -552,10 +574,10 @@ func (c *Channel) readRangeFrom(r io.ReaderAt, start, n int, reuse any) (any, er
 		}
 		return s, nil
 	}
-	return readTyped(r, c.path, c.dt, c.hasDT, c.spans, c.total, start, n, reuse)
+	return readTyped(r, c.path, c.dt, c.hasDT, c.spans, c.runs, c.total, start, n, reuse)
 }
 
-func readTyped(r io.ReaderAt, path string, dt DataType, hasDT bool, spans []span, total int64, start, n int, reuse any) (any, error) {
+func readTyped(r io.ReaderAt, path string, dt DataType, hasDT bool, spans []span, runs []spanRun, total int64, start, n int, reuse any) (any, error) {
 	if start < 0 || n < 0 || int64(start) > total || int64(n) > total-int64(start) {
 		return nil, wrap("read", path, fmt.Errorf("%w: range %d:%d of %d", ErrArgument, start, n, total))
 	}
@@ -569,7 +591,7 @@ func readTyped(r io.ReaderAt, path string, dt DataType, hasDT bool, spans []span
 		v, err := emptyOf(dt)
 		return v, wrap("read", path, err)
 	}
-	if v, ok, err := readFastSpans(dt, spans, r, start, n, reuse); ok || err != nil {
+	if v, ok, err := readFastSpans(dt, spans, runs, r, start, n, reuse); ok || err != nil {
 		if err != nil {
 			return nil, wrap("read", path, err)
 		}
@@ -580,7 +602,7 @@ func readTyped(r io.ReaderAt, path string, dt DataType, hasDT bool, spans []span
 		return nil, wrap("read", path, fmt.Errorf("%w: %s", ErrUnsupported, dt))
 	}
 	buf := make([]byte, n*sz)
-	if err := fillPackedSpans(spans, dt, r, start, n, sz, buf); err != nil {
+	if err := fillPackedSpans(spans, runs, dt, r, start, n, sz, buf); err != nil {
 		return nil, wrap("read", path, err)
 	}
 	v, err := decodePacked(dt, buf)
@@ -669,6 +691,9 @@ func (f *File) parse() error {
 		}
 		pos = segEnd
 	}
+	// appendSpan already merged each channel as segments arrived. A second
+	// walk here is a no-op on a uniform file and a full failed-merge scan
+	// on a file whose sample counts never repeat.
 	return nil
 }
 
@@ -1165,7 +1190,7 @@ func (f *File) addSpans(slots []rawSlot, dataPos, rawLen int64, interleaved, big
 		if err != nil {
 			return 0, err
 		}
-		s.ch.spans = append(s.ch.spans, sp)
+		s.ch.spans, s.ch.runs = appendSpan(s.ch.spans, s.ch.runs, sp)
 	}
 	if incomplete {
 		f.unusedTail = unused
@@ -1269,7 +1294,61 @@ func (c *Channel) readPacked(r io.ReaderAt, start, n, size int) ([]byte, error) 
 	return dst, nil
 }
 
-func (sp *span) copyValues(r io.ReaderAt, start, n int64, dst []byte) error {
+// copyRun reads n samples of a repeated span without expanding it into one
+// span per segment. Repeat i starts at dataPos + i*runStep.
+func (sp *span) copyRun(runs []spanRun, r io.ReaderAt, start, n int64, dst []byte) error {
+	if n == 0 {
+		return nil
+	}
+	if sp.runIdx == 0 || int(sp.runIdx) >= len(runs) || runs[sp.runIdx].count <= 1 || runs[sp.runIdx].step <= 0 || sp.partialN != 0 || sp.str || sp.nPerChunk <= 0 || sp.typeSize <= 0 {
+		return ErrCorrupt
+	}
+	per, err := mul64(sp.nChunks, sp.nPerChunk)
+	if err != nil || per <= 0 {
+		return ErrCorrupt
+	}
+	one := *sp
+	one.runIdx = 0
+	left := n
+	idx := start
+	dstOff := 0
+	for left > 0 {
+		rep := idx / per
+		within := idx % per
+		if rep < 0 || rep >= runs[sp.runIdx].count {
+			return ErrCorrupt
+		}
+		avail := per - within
+		if avail > left {
+			avail = left
+		}
+		shift, err := mul64(rep, runs[sp.runIdx].step)
+		if err != nil {
+			return err
+		}
+		pos, err := add64(sp.dataPos, shift)
+		if err != nil {
+			return err
+		}
+		one.dataPos = pos
+		nbytes := int(avail) * sp.typeSize
+		if nbytes < 0 || dstOff > len(dst) || nbytes > len(dst)-dstOff {
+			return ErrCorrupt
+		}
+		if err := one.copyValues(nil, r, within, avail, dst[dstOff:dstOff+nbytes]); err != nil {
+			return err
+		}
+		idx += avail
+		left -= avail
+		dstOff += nbytes
+	}
+	return nil
+}
+
+func (sp *span) copyValues(runs []spanRun, r io.ReaderAt, start, n int64, dst []byte) error {
+	if sp.runIdx != 0 {
+		return sp.copyRun(runs, r, start, n, dst)
+	}
 	full, err := mul64(sp.nChunks, sp.nPerChunk)
 	if err != nil {
 		return err
@@ -1408,7 +1487,10 @@ func (c *Channel) readStrings(r io.ReaderAt, start, n int) ([]string, error) {
 			break
 		}
 		sp := &c.spans[i]
-		spanN64, err := add64(mustMul(sp.nChunks, sp.nPerChunk), sp.partialN)
+		if sp.runIdx != 0 {
+			return nil, ErrCorrupt
+		}
+		spanN64, err := spanSamples(sp, nil)
 		if err != nil {
 			return nil, err
 		}

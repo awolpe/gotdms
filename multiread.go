@@ -79,7 +79,7 @@ func ReadValues(channels []*Channel) ([]any, error) {
 		sample := 0
 		for si := range c.spans {
 			sp := &c.spans[si]
-			cnt64, err := spanSamples(sp)
+			cnt64, err := spanSamples(sp, c.runs)
 			if err != nil {
 				return nil, wrap("read", c.path, err)
 			}
@@ -88,7 +88,7 @@ func ReadValues(channels []*Channel) ([]any, error) {
 			}
 			cnt := int(cnt64)
 			if interleavedSpan(sp) {
-				groups[ileaveKeyOf(sp)] = append(groups[ileaveKeyOf(sp)], ileaveMember{
+				groups[ileaveKeyOf(sp, c.runs)] = append(groups[ileaveKeyOf(sp, c.runs)], ileaveMember{
 					req: i, ch: c, sp: sp, sampleBase: sample,
 				})
 			} else if err := c.readSpanInto(file.r, sp, dst, sample, cnt); err != nil {
@@ -103,7 +103,7 @@ func ReadValues(channels []*Channel) ([]any, error) {
 	for _, members := range groups {
 		if len(members) < 2 {
 			m := members[0]
-			cnt64, err := spanSamples(m.sp)
+			cnt64, err := spanSamples(m.sp, m.ch.runs)
 			if err != nil {
 				return nil, wrap("read", m.ch.path, err)
 			}
@@ -136,6 +136,7 @@ type ileaveKey struct {
 	nChunks, nPerChunk         int64
 	partialPos, partialStride  int64
 	partialN                   int64
+	runStep, runCount          int64
 	big                        bool
 }
 
@@ -146,11 +147,12 @@ type ileaveMember struct {
 	sampleBase int
 }
 
-func ileaveKeyOf(sp *span) ileaveKey {
+func ileaveKeyOf(sp *span, runs []spanRun) ileaveKey {
 	return ileaveKey{
 		dataPos: sp.dataPos, chunkSize: sp.chunkSize, stride: sp.stride,
 		nChunks: sp.nChunks, nPerChunk: sp.nPerChunk,
 		partialPos: sp.partialPos, partialStride: sp.partialStride, partialN: sp.partialN,
+		runStep: sp.repeatStep(runs), runCount: sp.repeats(runs),
 		big: sp.big,
 	}
 }
@@ -165,8 +167,25 @@ func interleavedSpan(sp *span) bool {
 	return true
 }
 
-func spanSamples(sp *span) (int64, error) {
-	return add64(mustMul(sp.nChunks, sp.nPerChunk), sp.partialN)
+func spanSamples(sp *span, runs []spanRun) (int64, error) {
+	one, err := mul64(sp.nChunks, sp.nPerChunk)
+	if err != nil {
+		return 0, err
+	}
+	one, err = add64(one, sp.partialN)
+	if err != nil {
+		return 0, err
+	}
+	if sp.runIdx == 0 {
+		return one, nil
+	}
+	if int(sp.runIdx) >= len(runs) || runs[sp.runIdx].count <= 1 {
+		return 0, ErrCorrupt
+	}
+	if sp.partialN != 0 || runs[sp.runIdx].step <= 0 || sp.str || sp.live {
+		return 0, ErrCorrupt
+	}
+	return mul64(runs[sp.runIdx].count, one)
 }
 
 func (c *Channel) readSpanInto(r io.ReaderAt, sp *span, dst any, dstSample, n int) error {
@@ -181,14 +200,14 @@ func (c *Channel) readSpanInto(r io.ReaderAt, sp *span, dst any, dstSample, n in
 		return ErrCorrupt
 	}
 	if raw, ok := overlayAt(dst, dstSample, n, sz); ok && fixedNativeDT(c.dt) {
-		if err := sp.copyValues(r, 0, int64(n), raw); err != nil {
+		if err := sp.copyValues(c.runs, r, 0, int64(n), raw); err != nil {
 			return err
 		}
 		normalize(c.dt, raw, sp.big)
 		return nil
 	}
 	buf := make([]byte, n*sz)
-	if err := sp.copyValues(r, 0, int64(n), buf); err != nil {
+	if err := sp.copyValues(c.runs, r, 0, int64(n), buf); err != nil {
 		return err
 	}
 	normalize(c.dt, buf, sp.big)
@@ -197,28 +216,51 @@ func (c *Channel) readSpanInto(r io.ReaderAt, sp *span, dst any, dstSample, n in
 
 func splitInterleaved(r io.ReaderAt, members []ileaveMember, out []any) error {
 	sp0 := members[0].sp
+	runs0 := members[0].ch.runs
 	if sp0.stride <= 0 || sp0.nPerChunk < 0 {
 		return wrap("read", members[0].ch.path, ErrCorrupt)
 	}
 	for _, m := range members[1:] {
-		if m.sp.nChunks != sp0.nChunks || m.sp.nPerChunk != sp0.nPerChunk || m.sp.stride != sp0.stride || m.sp.partialN != sp0.partialN || m.sp.dataPos != sp0.dataPos {
+		if m.sp.nChunks != sp0.nChunks || m.sp.nPerChunk != sp0.nPerChunk || m.sp.stride != sp0.stride || m.sp.partialN != sp0.partialN || m.sp.dataPos != sp0.dataPos || m.sp.repeats(m.ch.runs) != sp0.repeats(runs0) || m.sp.repeatStep(m.ch.runs) != sp0.repeatStep(runs0) {
 			return wrap("read", m.ch.path, ErrCorrupt)
 		}
 	}
-	for chunk := int64(0); chunk < sp0.nChunks; chunk++ {
-		base, err := add64(sp0.dataPos, mustMul(chunk, sp0.chunkSize))
+	reps := sp0.repeats(runs0)
+	per, err := mul64(sp0.nChunks, sp0.nPerChunk)
+	if err != nil {
+		return wrap("read", members[0].ch.path, err)
+	}
+	for rep := int64(0); rep < reps; rep++ {
+		origin := sp0.dataPos
+		if rep > 0 {
+			shift, err := mul64(rep, sp0.repeatStep(runs0))
+			if err != nil {
+				return wrap("read", members[0].ch.path, err)
+			}
+			origin, err = add64(sp0.dataPos, shift)
+			if err != nil {
+				return wrap("read", members[0].ch.path, err)
+			}
+		}
+		baseAt, err := mul64(rep, per)
 		if err != nil {
 			return wrap("read", members[0].ch.path, err)
 		}
-		off, err := mul64(chunk, sp0.nPerChunk)
-		if err != nil || off > int64(math.MaxInt) {
-			return wrap("read", members[0].ch.path, ErrCorrupt)
-		}
-		if err := splitRows(r, members, out, base, sp0.stride, sp0.nPerChunk, int(off)); err != nil {
-			return err
+		for chunk := int64(0); chunk < sp0.nChunks; chunk++ {
+			base, err := add64(origin, mustMul(chunk, sp0.chunkSize))
+			if err != nil {
+				return wrap("read", members[0].ch.path, err)
+			}
+			off, err := add64(baseAt, mustMul(chunk, sp0.nPerChunk))
+			if err != nil || off > int64(math.MaxInt) {
+				return wrap("read", members[0].ch.path, ErrCorrupt)
+			}
+			if err := splitRows(r, members, out, base, sp0.stride, sp0.nPerChunk, int(off)); err != nil {
+				return err
+			}
 		}
 	}
-	if sp0.partialN > 0 {
+	if sp0.partialN > 0 && reps <= 1 {
 		off, err := mul64(sp0.nChunks, sp0.nPerChunk)
 		if err != nil || off > int64(math.MaxInt) {
 			return wrap("read", members[0].ch.path, ErrCorrupt)
@@ -274,7 +316,12 @@ func splitRows(r io.ReaderAt, members []ileaveMember, out []any, region, stride,
 		}
 		at := spanAt + int(done)
 		for _, m := range members {
-			if err := scatter(m, out[m.req], scratch, int(stride), at, int(take)); err != nil {
+			// at is relative to this span. Each member's span starts at its
+			// own sample index in its channel, so add that base per member.
+			if m.sampleBase < 0 || at > math.MaxInt-m.sampleBase {
+				return wrap("read", m.ch.path, ErrCorrupt)
+			}
+			if err := scatter(m, out[m.req], scratch, int(stride), m.sampleBase+at, int(take)); err != nil {
 				return wrap("read", m.ch.path, err)
 			}
 		}
