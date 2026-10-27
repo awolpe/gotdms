@@ -4,6 +4,11 @@ The Go module proxy learns about a version only after a `vX.Y.Z` tag is pushed t
 
 ## Unreleased
 
+### Added
+
+- `Defragment`, `DefragmentToFile`, and `DefragmentFile` rewrite a fragmented file (one segment per append) as a single contiguous segment, so later reads are faster, matching the intent of NI LabVIEW's TDMS Defragment. The channel tree, channel order, data types, every value, and each object's final property values are unchanged; output is little-endian TDMS 2.0. A file whose data channels are all fixed-size is copied byte for byte through a declared-count `Stream`, with no value decode or re-encode and resident memory bounded by one `WithReadBuffer`-sized batch per channel; a file with a string channel takes a buffered path (the offset table needs every length first). `DefragmentFile` rewrites in place through a temporary file renamed over the original, so an interrupted run leaves either the old file or the new one. DAQmx raw data returns `ErrDAQmx` and a big-endian segment returns `ErrUnsupported`, checked before any byte is written, because this package produces neither layout; a zero-sample channel is kept as a metadata object but re-reads as void. `ReaderOption`s pass through, so `WithLenientTail` defragments a file that ends in a recoverable torn tail. See [docs/defragment.md](docs/defragment.md).
+- `gotdms defragment [-o out.tdms] [--lenient] file.tdms`. With no `-o` the file is rewritten in place; `-o` writes a copy and leaves the input untouched; `--lenient` opens with `WithLenientTail` first.
+
 ## v0.2.0 (2026-10-23)
 
 `v0.2.0` is the changes since `v0.1.2` (`8d2f134`).
